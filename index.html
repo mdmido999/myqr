@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#111827" />
+  <title>QR Scanner</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial;margin:0;padding:16px;background:#111827;color:#fff}
+    .box{max-width:560px;margin:auto}
+    video{width:100%;border-radius:14px;background:#000;border:1px solid rgba(255,255,255,.15)}
+    button{padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:#2563eb;color:#fff;font-weight:700;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin:12px 0}
+    .msg{white-space:pre-wrap;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);padding:10px 12px;border-radius:12px;line-height:1.6}
+    .small{font-size:12px;opacity:.85}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h3 style="margin:0 0 10px">امسح QR للدخول</h3>
+
+    <video id="v" playsinline muted></video>
+
+    <div class="row">
+      <button id="start">تشغيل الكاميرا</button>
+      <button id="stop" disabled style="background:#374151">إيقاف</button>
+    </div>
+
+    <div class="msg" id="m">جاهز.</div>
+    <div class="small" style="margin-top:8px">
+      • لازم HTTPS (GitHub Pages OK).<br/>
+      • يتم إرسال البيانات للصفحة الأم (الميكروتك) لتعمل submit.
+    </div>
+  </div>
+
+<script>
+  // ====== إعدادات مهمّة ======
+  // لو الـQR بيكون "user فقط" وعايز تخلي الباسورد = نفس اليوزر:
+  const USER_ONLY_AS_PASS = false;
+
+  // لتقييد استقبال الرسائل في الميكروتك: هناك تحقق من ev.origin = "https://YOURGITHUB.github.io"
+  // هنا الإرسال للـ parent سيتم بـ "*" لأن الدومين قد يختلف (IP/Domain) — والتأمين يكون في parent.
+
+  const v = document.getElementById("v");
+  const m = document.getElementById("m");
+  const btnStart = document.getElementById("start");
+  const btnStop  = document.getElementById("stop");
+
+  let stream = null;
+  let running = false;
+  let barcodeDetector = null;
+  let jsqrLoaded = false;
+
+  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+  const setMsg = (t)=>m.textContent = t;
+
+  function secureOk(){
+    return window.isSecureContext || location.hostname === "localhost";
+  }
+
+  function parsePayload(raw){
+    raw = (raw || "").trim();
+
+    // 1) user|pass OR user:pass OR user,pass
+    const sep = raw.includes("|") ? "|" : (raw.includes(":") ? ":" : (raw.includes(",") ? "," : ""));
+    if (sep){
+      const [u,p] = raw.split(sep).map(s => (s||"").trim());
+      return { username: u || "", password: p || "" , raw };
+    }
+
+    // 2) JSON {"u":"..","p":".."} أو {"user":"..","pass":".."}
+    try{
+      const o = JSON.parse(raw);
+      const u = (o.u ?? o.user ?? o.username ?? "").toString().trim();
+      const p = (o.p ?? o.pass ?? o.password ?? "").toString().trim();
+      if (u || p) return { username: u, password: p, raw };
+    }catch(e){}
+
+    // 3) default: user فقط
+    return { username: raw, password: USER_ONLY_AS_PASS ? raw : "", raw };
+  }
+
+  function sendToParent(payload){
+    // الرسالة لصفحة الميكروتك الأم
+    window.parent.postMessage({
+      type: "qr-login",
+      username: payload.username,
+      password: payload.password,
+      raw: payload.raw
+    }, "*");
+  }
+
+  async function initBarcodeDetector(){
+    if ("BarcodeDetector" in window){
+      try{
+        barcodeDetector = new BarcodeDetector({ formats: ["qr_code"] });
+        return true;
+      }catch(e){
+        barcodeDetector = null;
+      }
+    }
+    return false;
+  }
+
+  async function loadJsQR(){
+    if (jsqrLoaded) return true;
+    return new Promise((resolve)=>{
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js";
+      s.onload = ()=>{ jsqrLoaded = true; resolve(true); };
+      s.onerror = ()=>resolve(false);
+      document.head.appendChild(s);
+    });
+  }
+
+  async function startCamera(){
+    if (!secureOk()){
+      setMsg("لازم HTTPS لتشغيل الكاميرا.\nارفع الصفحة على GitHub Pages.");
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia){
+      setMsg("المتصفح لا يدعم تشغيل الكاميرا.");
+      return;
+    }
+
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+        audio: false
+      });
+
+      v.srcObject = stream;
+      await v.play();
+
+      running = true;
+
+      const hasBD = await initBarcodeDetector();
+      if (hasBD){
+        setMsg("Scanning… (BarcodeDetector)");
+        scanLoopBarcodeDetector();
+      } else {
+        const ok = await loadJsQR();
+        if (!ok){
+          setMsg("تعذّر تحميل jsQR. جرّب Chrome/Edge أو تأكد إن الدومين مسموح في walled garden.");
+          stopCamera();
+          return;
+        }
+        setMsg("Scanning… (jsQR fallback)");
+        scanLoopJsQR();
+      }
+
+    }catch(e){
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      setMsg("فشل تشغيل الكاميرا. افحص Permission.\n" + e);
+      stopCamera(true);
+    }
+  }
+
+  function stopCamera(silent=false){
+    running = false;
+
+    if (v){
+      try{ v.pause(); }catch{}
+      v.srcObject = null;
+    }
+    if (stream){
+      try{ stream.getTracks().forEach(t=>t.stop()); }catch{}
+      stream = null;
+    }
+
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+
+    if (!silent) setMsg("تم الإيقاف.");
+  }
+
+  async function scanLoopBarcodeDetector(){
+    while (running && stream && barcodeDetector){
+      try{
+        const codes = await barcodeDetector.detect(v);
+        if (codes && codes.length){
+          const raw = codes[0].rawValue || "";
+          const payload = parsePayload(raw);
+
+          setMsg("تمت القراءة. جاري إرسال البيانات للهوتسبوت…");
+          sendToParent(payload);
+
+          stopCamera(true);
+          setMsg("تم الإرسال. انتظر تسجيل الدخول…");
+          return;
+        }
+      }catch(e){}
+      await sleep(120);
+    }
+  }
+
+  async function scanLoopJsQR(){
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    while (running && stream){
+      try{
+        const w = v.videoWidth, h = v.videoHeight;
+        if (w && h){
+          canvas.width = w; canvas.height = h;
+          ctx.drawImage(v, 0, 0, w, h);
+          const img = ctx.getImageData(0, 0, w, h);
+          const code = window.jsQR(img.data, w, h, { inversionAttempts: "attemptBoth" });
+          if (code?.data){
+            const payload = parsePayload(code.data);
+
+            setMsg("تمت القراءة. جاري إرسال البيانات للهوتسبوت…");
+            sendToParent(payload);
+
+            stopCamera(true);
+            setMsg("تم الإرسال. انتظر تسجيل الدخول…");
+            return;
+          }
+        }
+      }catch(e){}
+      await sleep(160);
+    }
+  }
+
+  btnStart.addEventListener("click", startCamera);
+  btnStop.addEventListener("click", ()=>stopCamera());
+
+  // شغّل تلقائيًا لو تحب:
+  // startCamera();
+</script>
+</body>
+</html>
